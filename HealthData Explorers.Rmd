@@ -1,0 +1,1363 @@
+---
+title: "Insights into Sepsis Survival"
+author: 'HealthData Explorers: Alberto Barbesin, Nicolae Bologa, Eleonora Marcassa'
+output:
+  html_document:
+    theme: spacelab
+    highlight: pygments
+    toc: yes
+    toc_depth: 2
+    number_sections: yes
+    toc_float:
+      smooth_scroll: no
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+editor_options:
+  chunk_output_type: console
+  markdown:
+    wrap: sentence
+---
+
+```{=html}
+<style>
+body{text-align: justify}
+</style>
+```
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include = FALSE}
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(corrplot)
+library(patchwork)
+library(cowplot)
+library(survival)
+library(knitr)
+library(modeldata)
+library(recipes)
+library(smotefamily)
+library(caret)
+library(pROC)
+library(lubridate)
+library(ggsurvfit)
+library(gtsummary)
+library(tidycmprsk)
+library(survival)
+library(survminer)
+library(cmstatr)
+library(survminer)
+library(broom)
+```
+
+# The Dataset
+
+***Sepsis*** is a life-threatening condition caused by an exaggerated reaction of the body to an infection, that leads to organ failure or even death.
+Since *sepsis* can kill a patient even in just one hour, survival prediction is an urgent priority among the medical community: even if laboratory tests and hospital analyses can provide insightful information about the patient, in fact, they might not come in time to allow medical doctors to recognize an immediate death risk and treat it properly.
+The features of patients that has been recorded at the hospital admission are:
+
+-   `sex`,
+
+-   `age`,
+
+-   `septic episode number`.
+
+We considered a cohort of 110,204 patient admissions.
+
+For the **primary cohort**, the records represent patients with potential sepsis preconditions (according to the pre-Sepsis-3 definition); for the **study cohort**, they represent only patient admissions defined by the new Sepsis-3 definition.
+
+```{r, fig.align = "center"}
+# survival_primary_cohort
+(survival_primary_cohort <- read_csv("primary_cohort.csv") %>%
+  rename(age = age_years,
+         sex = sex_0male_1female,
+         count_episode = episode_number,
+         hospital_outcome = hospital_outcome_1alive_0dead) %>%
+  mutate(sex_cat = ifelse(sex == 0, "male", "female"), hospital_outcome_cat = ifelse(hospital_outcome == 1, "alive", "dead")))
+```
+
+```{r, fig.align = "center"}
+# survival_study_cohort
+(survival_study_cohort <- read_csv("study_cohort.csv") %>%
+  rename(age = age_years,
+         sex = sex_0male_1female,
+         count_episode = episode_number,
+         hospital_outcome = hospital_outcome_1alive_0dead) %>%
+    mutate(sex_cat = ifelse(sex == 0, "male", "female"), hospital_outcome_cat = ifelse(hospital_outcome == 1, "alive", "dead")))
+```
+
+```{r, fig.align = "center"}
+# survival_validation_cohort
+(survival_validation_cohort <- read_csv("validation_cohort.csv") %>%
+  rename(age = age_years,
+         sex = sex_0male_1female,
+         count_episode = episode_number,
+         hospital_outcome = hospital_outcome_1alive_0dead) %>%
+    mutate(sex_cat = ifelse(sex == 0, "male", "female"), hospital_outcome_cat = ifelse(hospital_outcome == 1, "alive", "dead")))
+```
+
+A first glance to all the three datasets reveals that the variables `sex` and `hospital_outcome` are binary variables.
+In order to carry out the analysis, it can be helpful converting them in categorical variables.
+
+# Exploratory Analysis
+
+## Survival primary cohort
+
+### Structure and summary of data and some exploratory plots
+
+```{r, fig.align = "center"}
+str(survival_primary_cohort)
+
+summary(survival_primary_cohort[!(colnames(survival_primary_cohort) %in% c("sex_cat", "hospital_outcome_cat"))])
+```
+
+Variables `age`,`count hospital` and `hospital outcome` are *quite symmetrical*.
+We can't say the same for the other ones.
+
+```{r, fig.align = "center"}
+survival_primary_cohort %>%
+  select(age) %>%
+  gather(key = "cols", value = "value") %>%
+  ggplot(aes(x = value)) + 
+  geom_histogram(bins = 20, fill = "lightyellow", col = "black") + 
+  facet_wrap(. ~ cols, ncol = 1) +
+  labs(x = "Value", y = "Frequency") + 
+  theme_bw()
+```
+
+This very first graph highlights the fact the data collected belong mostly to older patients.
+As a matter of fact, the distribution is *left skewed*.
+
+```{r}
+survival_primary_cohort %>% 
+  group_by(sex_cat) %>% 
+  summarise(n = n(), mean= n/length(survival_primary_cohort$sex_cat))
+```
+
+```{r, fig.align = "center"}
+survival_primary_cohort %>%
+  select(sex, hospital_outcome) %>%
+  gather(cols, value) %>%
+  ggplot(aes(x = value)) + 
+  geom_bar(fill = "lightyellow", col = "black") + 
+  facet_wrap(.~ cols, ncol = 2) +
+  labs(x = "Value", y = "Frequency") +
+  theme_bw()
+```
+
+The graph representing `hospital_outcome` reveals a low mortality rate among patients affected by sepsis, with the majority surviving.\
+Furthermore, analysis of the `sex` variable indicates a higher proportion of male patients compared to females, as showed in the accompanying table.
+
+```{r, fig.align = "center"}
+survival_primary_cohort %>% 
+  group_by(sex) %>% 
+  summarise(m_age = mean(age), 
+            sd_age = sd(age), 
+            freq = n()) %>% 
+  arrange(desc(sex))
+
+spc_by_age <- survival_primary_cohort %>% 
+  group_by(age) %>% 
+  summarise(m_sex = mean(sex), 
+            sd_sex = sd(sex), 
+            freq = n()) %>% 
+  arrange(desc(freq))
+```
+
+```{r, fig.align = "center"}
+survival_primary_cohort %>% 
+  ggplot(aes(x = sex_cat, y = age, fill = hospital_outcome_cat)) +
+  geom_boxplot(show.legend = TRUE) +
+  labs(title = "Hospital outcome by age and gender", 
+       x = "Gender", 
+       y = "Age", 
+       fill = "Hospital outcome")+
+  scale_fill_manual(values = c("alive" = "lightyellow", "dead" = "darkgrey"), 
+                    labels = c("Alive", "Dead")) +
+  theme_bw()
+```
+
+From a very first glance at the graph, an asymmetry in the data can be noticed by looking at the location of the median.
+Besides the fact that it seems to be a quite strong relationship between `age` and `death`.
+In addition, *females* are likely to live two years longer than *males.*
+
+The dataset is splitted into two parts, in order to better distinguish *survived* and *dead* people.
+
+```{r, fig.align = "center"}
+(dead_survival_primary_cohort <- survival_primary_cohort%>%
+  filter(hospital_outcome_cat=="dead" & hospital_outcome==0))
+```
+
+```{r, fig.align = "center"}
+(survived_survival_primary_cohort <- survival_primary_cohort%>%
+   filter(hospital_outcome_cat=="alive" & hospital_outcome==1))
+```
+
+```{r, fig.align = "center"}
+(n_episodes <- survived_survival_primary_cohort%>%
+group_by(count_episode)%>%
+summarise(n = n()))
+```
+
+```{r, fig.align = "center"}
+ggplot(n_episodes, aes(x = count_episode, y = n)) +
+  geom_bar(stat = "identity", fill = "lightyellow", color = "black") +
+  labs(y = "# Admissions", x = "N. of episodes", title = "Primary Cohort: Survived Patients") +
+  theme_bw() +
+  coord_flip()
+```
+
+Thanks to a combined reading of the previously presented tables and this last graph, it can be understood that the majority of the people had just one episode of *sepsis*.
+As a matter of fact, this one and only episode involve about 80,000 people.
+This number fastly decrease: "just" 15,000 people showed two episodes of *sepsis*.
+The greater the number of episodes the lower is the number of people who presented the infection: it gets lower than 5,000.
+
+Keep in mind that these number represent all the people who got affected by the disease but survived.
+
+While the following results are about people who got the infection but died.
+
+```{r, fig.align = "center"}
+(n_episodes <- dead_survival_primary_cohort%>%
+group_by(count_episode)%>%
+summarise(n = n()))
+```
+
+```{r, fig.align = "center"}
+ggplot(data = n_episodes, aes(x = count_episode, y = n)) +
+  geom_bar(stat = "identity", fill = "darkgrey", color = "black") +
+  labs(y = "# Admissions", x = "N. of episodes", title = "Primary Cohort: Dead Patients") +
+  theme_bw() + 
+  coord_flip()
+```
+
+In this case, the number of dead people who showed just one case of *sepsis* is around 6,000.
+Then the number decreases to c.a.
+1,500 when the episodes increase at 2.
+As before, the greater the number of episodes the lower the number of infected patients who died.
+
+### Probability of getting *sepsis*
+
+We are interested in determining whether men with *sepsis* tend to be older than women, and vice versa.
+Additionally, we are exploring whether there is a gender and age-related difference in survival likelihood.
+
+```{r, fig.align = "center"}
+male = survival_primary_cohort %>% filter(sex == 0)
+female = survival_primary_cohort %>% filter(sex == 1)
+
+m_mean_age = mean(male$age)
+m_sd_age = sd(male$age)
+f_mean_age = mean(female$age)
+f_sd_age = sd(female$age)
+
+# males' age average
+m_mean_age
+# males' age standard deviation
+m_sd_age
+
+# females' age average
+f_mean_age
+# females' age standard deviation
+f_sd_age
+
+plot_male <- ggplot(male) +
+  geom_histogram(aes(x = age, 
+                     y = after_stat(density)), 
+                 bins = 15, 
+                 fill = "lightblue", 
+                 color = "black") +
+  stat_function(fun = dnorm, 
+                args = list (mean = m_mean_age, sd = m_sd_age), 
+                color = "red") +
+  labs(title = "Males' Age Distirbution", x = "Age", y = "Density") +
+  theme_bw()
+
+plot_female <- ggplot(female) +
+  geom_histogram(aes(x = age, 
+                     y = after_stat(density)), 
+                 bins = 15, 
+                 fill = "#FFDAB9", 
+                 color = "black") +
+  stat_function(fun = dnorm, 
+                args = list (mean = m_mean_age, sd = m_sd_age), 
+                color = "red") +
+  labs(title = "Females' Age Distirbution", x = "Age", y = "Density") +
+  theme_bw()
+
+gridExtra::grid.arrange(grobs = list(plot_male, plot_female), nrow = 1, ncol = 2)
+```
+
+Building upon our initial observations, individuals affected by *sepsis* tend to be older, as evidenced by the continued presence of a *left-skewed* distribution.
+Now, let's look at whether men and women under 81, which is younger than the third quantile, are more likely to get *sepsis* according.
+
+```{r, fig.align = "center"}
+# probability males are younger than 81
+prob_males <- pnorm(quantile(survival_primary_cohort$age, probs = 0.75), 
+                    m_mean_age, 
+                    m_sd_age, 
+                    lower.tail = T)
+
+# probability females are younger than 81 
+prob_females <- pnorm(quantile(survival_primary_cohort$age, probs = 0.75), 
+                      f_mean_age, 
+                      f_sd_age, 
+                      lower.tail = T)
+
+probs_df <- data.frame(age = seq(0,120, by = 1),
+                       prob_males = pnorm(seq(0,120,by=1), 
+                                          m_mean_age, 
+                                          m_sd_age, 
+                                          lower.tail = T), 
+                       prob_females = pnorm(seq(0,120,by=1), 
+                                            f_mean_age, 
+                                            f_sd_age, 
+                                            lower.tail = T))
+
+pnorm_plot <- ggplot(probs_df, aes(x = age)) +
+  stat_function(fun = pnorm, 
+                args = list(mean = m_mean_age, sd = m_sd_age), 
+                color = "lightblue", 
+                linewidth = 1.3) +
+  stat_function(fun = pnorm, 
+                args = list(mean = f_mean_age, sd = f_sd_age), 
+                color = "#FFDAB9", 
+                linewidth = 1.3) +
+  labs(x = "Age", y="Probability") +
+  theme_bw()
+
+dnorm_plot <- ggplot(probs_df, aes(x = age)) +
+  stat_function(fun = dnorm, 
+                args = list(mean = m_mean_age, sd = m_sd_age), 
+                color = "lightblue", 
+                linewidth = 1.3) +
+  stat_function(fun = dnorm, 
+                args = list(mean = f_mean_age, sd = f_sd_age), 
+                color = "#FFDAB9", 
+                linewidth = 1.3) +
+  labs(x = "Age", y="Probability") +
+  theme_bw()
+
+combined_plots <- gridExtra::grid.arrange(grobs = list(pnorm_plot, dnorm_plot), ncol = 2, top = "Probability of being younger than 81 y/o by gender")
+```
+
+Once computed the probability of getting the *sepsis* infection, it is possible to affirm that the 77,30% of women and the 77,84% of men younger than the age third quantile get the infection at least one time.
+So quite similar probabilities for both women and men.
+
+Do they have the same probability of death if they are younger than the third quantile?
+
+```{r, fig.align = "center"}
+male_dead = survival_primary_cohort %>% 
+  filter(sex == 0 & hospital_outcome == 0)
+
+female_dead = survival_primary_cohort %>% 
+  filter(sex == 1 & hospital_outcome == 0)
+
+md_mean_age = mean(male_dead$age)
+md_sd_age = sd(male_dead$age)
+fd_mean_age = mean(female_dead$age)
+fd_sd_age = sd(female_dead$age)
+
+# probability males who died of sepsis are younger than 81
+prob_males <- pnorm(quantile(survival_primary_cohort$age, probs = 0.75), 
+                    md_mean_age, 
+                    md_sd_age, 
+                    lower.tail = T)
+
+# probability females who died of sepsis are younger than 81
+prob_females <- pnorm(quantile(survival_primary_cohort$age, probs = 0.75), 
+                      fd_mean_age, 
+                      fd_sd_age, 
+                      lower.tail = T)
+
+probs_df <- data.frame(age = seq(0, 120, by = 1),
+                       prob_males = pnorm(seq(0, 120, by = 1), 
+                                          md_mean_age, 
+                                          md_sd_age, 
+                                          lower.tail = TRUE),
+                       prob_females = pnorm(seq(0, 120, by = 1), 
+                                            fd_mean_age, 
+                                            fd_sd_age, 
+                                            lower.tail = TRUE))
+
+pnorm_plot <- ggplot(data = probs_df, aes(x = age)) +
+  stat_function(fun = pnorm, 
+                args = list(mean = md_mean_age, sd = md_sd_age), 
+                color = "lightblue", 
+                linewidth = 1.3) +
+  stat_function(fun = pnorm, 
+                args = list(mean = fd_mean_age, sd = fd_sd_age), 
+                color = "#FFDAB9", 
+                linewidth= 1.3) +
+  labs(x = "Age", y = "Probability") +
+  theme_bw()
+
+dnorm_plot <- ggplot(data = probs_df, aes(x = age)) +
+  stat_function(fun = dnorm, 
+                args = list(mean = md_mean_age, 
+                            sd = md_sd_age), 
+                color = "lightblue", 
+                linewidth = 1.3) +
+  stat_function(fun = dnorm, 
+                args = list(mean = fd_mean_age, sd = fd_sd_age), 
+                color = "#FFDAB9", 
+                linewidth = 1.3) +
+  labs(x = "Age", y = "Probability") +
+  theme_bw()
+
+combined_plots <- gridExtra::grid.arrange(grobs = list(pnorm_plot, dnorm_plot), ncol = 2, top = "Probability of dying younger than 81 y/o by gender")
+```
+
+Relying upon this probabilities, men younger than 81 are more likely to get *sepsis* before in life time than women.
+As a matter of fact, women who get infected before the third quantile age are the 57.03% of the total feminine population; while men are the 63.39% of the total masculine population.
+
+## Survival study cohort
+
+```{r, fig.align = "center"}
+survival_study_cohort
+```
+
+```{r, fig.align = "center"}
+str(survival_study_cohort)
+summary(survival_study_cohort)
+```
+
+As already did for the previous dataset, the following one is split into two too: *survived* and *dead* people.
+
+```{r, fig.align = "center"}
+(survived_survival_study_cohort <- survival_study_cohort %>%
+   filter(hospital_outcome_cat=="alive" & hospital_outcome==1))
+```
+
+```{r, fig.align = "center"}
+(dead_survival_study_cohort <- survival_study_cohort %>% 
+   filter(hospital_outcome==0 & hospital_outcome_cat =="dead"))
+```
+
+```{r, fig.align = "center"}
+
+(n_episodes <- survived_survival_study_cohort %>%
+   group_by(count_episode) %>%
+   summarise(n = n()))
+
+plot_survived <- ggplot(data = n_episodes, aes(x = count_episode, y = n)) +
+  geom_bar(stat = "identity", fill = "lightyellow", color = "black") +
+  labs(title = "Study Cohort: Survived Patients", 
+       y = "# Admissions", 
+       x = "N. of episodes") +
+  theme_bw() + 
+  coord_flip()
+
+(n_episodes <- dead_survival_study_cohort %>%
+    group_by(count_episode) %>%
+    summarise(n = n()))
+
+plot_dead <- ggplot( n_episodes, aes(x = count_episode, y = n)) +
+  geom_bar(stat = "identity", color = "black", fill = "darkgrey") +
+  labs(title = "Study Cohort: Dead Patients", 
+       y = "# Admissions", 
+       x = "N. of episodes") +
+  theme_bw() +
+  coord_flip()
+
+combined_plots <- gridExtra::grid.arrange(grobs = list(plot_survived, plot_dead), ncol = 2)
+```
+
+By looking at the plots, it is possible to notice that even in the `survival_study_cohort`, distinguished in *survived* and *dead*, the behavior of the data is the same as the one previously seen: the greater the `N. of episodes`, the lower is the `# Admissions`.
+
+```{r, fig.align = "center"}
+(numerical_data_study <- survival_study_cohort[, sapply(survival_study_cohort, is.numeric)])
+```
+
+```{r, fig.align = "center"}
+cor(numerical_data_study)
+```
+
+While computing the correlation between variables in the dataset, it can be concluded that there isn't a strong relationship.
+
+```{r, fig.align = "center"}
+corr_matrix_study = cor(numerical_data_study)
+heatmap(corr_matrix_study,
+        Colv = NA, 
+        Rowv = NA, 
+        scale="column")
+```
+
+## Survival validation
+
+```{r, fig.align = "center"}
+str(survival_validation_cohort)
+
+summary(survival_validation_cohort[!(colnames(survival_primary_cohort) %in% 
+                                       c("sex_cat", "hospital_outcome_cat"))])
+```
+
+Here we can see that `age` is strongly symmetrical.
+While, the `count_episode` seems to be just quite symmetrical.
+
+```{r, fig.align = "center"}
+(survival_validation_cohort %>% 
+  ggplot(aes(x = sex_cat, 
+             y = age, 
+             fill = hospital_outcome_cat)) +
+  geom_boxplot(show.legend = TRUE) +
+  labs(title = "Hospital outcome by age and gender", 
+       x = "Gender", 
+       y = "Age", 
+       fill = "Hospital outcome")+
+  scale_fill_manual(values = c("alive" = "lightyellow", 
+                               "dead" = "darkgrey"), 
+                    labels = c("Alive", 
+                               "Dead")) +
+  theme_bw())
+```
+
+As already did for the previous datasets, the `survival_validation_cohort` is split into two parts too: *survived* and *dead* people.
+
+```{r, fig.align = "center"}
+(survived_survival_study_cohort <- survival_study_cohort %>%
+  filter(hospital_outcome_cat=="alive" & hospital_outcome==1))
+```
+
+```{r, fig.align = "center"}
+(dead_survival_study_cohort <- survival_study_cohort %>%
+  filter(hospital_outcome==0 & hospital_outcome_cat =="dead"))
+```
+
+```{r, fig.align = "center"}
+(n_episodes <- survived_survival_study_cohort %>%
+   group_by(count_episode) %>%
+   summarise(n = n()))
+
+plot_survived <- ggplot(data = n_episodes,
+                        aes(x = count_episode, 
+                            y = n)) +
+  geom_bar(stat = "identity", 
+           fill = "lightyellow", 
+           color = "black") +
+  labs(title = "Study Cohort: Survived Patients", 
+       y = "# Admissions", 
+       x = "N. of episodes") +
+  theme_bw() + 
+  coord_flip()
+
+(n_episodes <- dead_survival_study_cohort %>% 
+    group_by(count_episode) %>% 
+    summarise(n = n()))
+
+plot_dead<- ggplot(data = n_episodes, 
+                   aes(x = count_episode, y = n)) +
+  geom_bar(stat = "identity", 
+           fill = "darkgrey", 
+           color = "black") +
+  labs(title = "Study Cohort: Survived Patients", 
+       y = "# Admissions", 
+       x = "N. of episodes") +
+  theme_bw() + 
+  coord_flip()
+
+combined_plots <- gridExtra::grid.arrange(grobs = list(plot_survived, plot_dead), ncol = 2)
+```
+
+```{r, fig.align = "center"}
+(numerical_data_study <- survival_study_cohort[, sapply(survival_study_cohort, is.numeric)])
+```
+
+```{r, fig.align = "center"}
+cor(numerical_data_study)
+```
+
+The computed correlation shows that there isn't a strong relationship between the variables.
+
+```{r, fig.align = "center"}
+corr_matrix_study = cor(numerical_data_study)
+heatmap(corr_matrix_study,
+        Colv = NA, 
+        Rowv = NA, 
+        scale="column")
+```
+
+# Sampling methods
+
+```{r, fig.align = "center"}
+table(survival_primary_cohort$hospital_outcome)
+```
+
+```{r, fig.align = "center"}
+survival_primary_cohort <- survival_primary_cohort %>%
+  select(age,
+         sex,
+         count_episode,
+         hospital_outcome)
+```
+
+```{r}
+survival_primary_cohort$hospital_outcome <- as.factor(survival_primary_cohort$hospital_outcome)
+survival_primary_cohort$sex <- as.factor(survival_primary_cohort$sex)
+survival_primary_cohort$count_episode <- as.factor(survival_primary_cohort$count_episode)
+```
+
+# Logistic Regression
+
+We want to fit a model of ***logistic regression*** of this type: $$ p(x) = \text{Pr}(Y = 0 | x) = \frac{e^{\beta_0+\beta_kx}}{1 + e^{\beta_0+\beta_kx}} $$
+
+## Adjusting the Loss Function
+
+We increase the weights of the minority class for the loss function.
+Then when we fit the *logistic regression* model, we specify the resulting weights in the parameter *weights*.
+
+-   `table(target_variable)` calculates the frequency of each class in the binary target variable.
+
+-   `prop.table(class_freq)` calculates the proportions of each class frequency relative to the total number of observations.
+
+-   `1 / prop.table(class_freq)` calculates the inverse of the proportions to create class weights.
+    The less frequent class (minority class) will have a higher weight, while the more frequent class (majority class) will have a lower weight.
+
+```{r, fig.align = "center"}
+class_freq <- table(survival_primary_cohort$hospital_outcome) # calculates the frequency of each class in the binary target variable.
+
+# Calculate class weights
+class_weights <- 1 / prop.table(class_freq)
+# calculates the inverse of the proportions to create class weights. 
+(class_weights <- round(class_weights, digits = 5))
+```
+
+```{r, fig.align = "center"}
+survival_primary_cohort
+```
+
+## Computing the optimal treshold
+
+```{r, fig.align = "center"}
+log_survival_cohort <- glm(hospital_outcome ~ ., 
+                           data = survival_primary_cohort, 
+                           family ="binomial")
+summary(log_survival_cohort)
+```
+
+It is possible to see that `count_episode` and `age` have a *negative relationship* with the target variable (`hospital outcome`), meaning that to an increase in the number of episodes of *sepsis* or in the age - or both of them - leads to a decrease in the survival.\
+Instead, `sex` has a positive relationship with the target variable, so that males has an higher probability of death in comparison with women.
+In addition, `age` and `sex` are *strongly significant*.
+In the `count_episode` variable, just `count_episode2` is strongly significant, whose alpha value is approximately `r round(summary(log_survival_cohort)$coefficients["count_episode2", "Pr(>|z|)"], 3)`. While the other `count_episode` variables aren't that significant.  
+On the other hand, we can say that to an increase of the number of episodes there's a higher probability of dying while comparing men and women together. 
+
+Note that we used the `count_episode` variables as categorical as we interested in discovering the correlation between the number of episodes and the negative hospital outcome. This is due to the fact that it is not an only mortal hilliness, but it can bring to the failure of any organ in the human body. Moreover, we do not have any data that help us know which organs fail most or how many episodes manifest before an organ failure. Indeed, working on a numerical `count_episode` variable would lead us to take conclusions that may be different from the reality.   
+
+Let's test the data by creating a training and a test set.
+The train set includes randomly the 80% of the observation in the `survival_primary_cohort` dataset.
+While the test set includes the remaining random 20% of the same dataset.
+
+```{r, fig.align = "center"}
+n.sample <- nrow(survival_primary_cohort)
+size = round(0.8 * n.sample)
+set.seed(123)
+idx = sample(n.sample, size)
+train_data_primary = survival_primary_cohort[idx,]
+test_data_primary = survival_primary_cohort[-idx,]
+```
+
+```{r, fig.align = "center"}
+train_data_primary
+```
+
+```{r, fig.align = "center"}
+log_survival_primary <- glm(hospital_outcome~ ., 
+                            data = train_data_primary, 
+                            family ="binomial")
+
+summary(log_survival_primary)
+```
+
+It is possible to observe that the results are quite the same of the previous *logistic regression* analysis.
+
+In order to see if the model is making a good prediction of a positive `hospital_outcome`, we might want to calculate the *misclasification rate*.  
+
+```{r, fig.align = "center"}
+table(test_data_primary$hospital_outcome)
+```
+
+```{r, fig.align = "center"}
+pred_primary <- predict(log_survival_primary, 
+                        test_data_primary, 
+                        type="response")
+
+class_primary <- ifelse(pred_primary >= 0.85, 1,0)
+(mr_primary <- mean(class_primary != test_data_primary$hospital_outcome))
+```
+
+A *misclassification rate* of the `r round(mr_primary*100, 2)`% indicates a relatively low level of error, implying that the model has a pretty strong predictive capacity.
+
+```{r, fig.align = "center"}
+# confusion matrix
+(cf_primary <- table(predicted = class_primary, 
+                     actual = test_data_primary$hospital_outcome))
+
+# computing sensitivity
+(Se <- cf_primary[2, 2] / sum(cf_primary[, 2]))
+
+# computing specificity
+(Spe <- cf_primary[1, 1] / sum(cf_primary[, 1]))
+```
+
+The $confusion$ $matrix$ suggest us that the model identifies well the positive outcomes.
+However, the low value of $TN$, in conjunction of the `r cf_primary[2,1]` $FP$, suggests the model struggling in predicting a negative outcome.\
+This influences the result in the computation of the **ROC Curve**.
+
+```{r, fig.align = "center"}
+roc_curve <- roc(test_data_primary$hospital_outcome~pred_primary, plot = T, col="darkblue", print.auc = T, main = "ROC Curve for survival primary")
+```
+
+As a matter of fact, an **Area Under the Curve** of 0.705 highlights that the model has a good discriminant capacity, but it can be surely improved - take into account that an **AUC** = 0.5 means that the model makes random predictions.
+
+```{r, fig.align = "center"}
+(optimal_threshold <- coords(roc_curve, "best", best.method = "closest.topleft"))
+```
+
+```{r, fig.align = "center"}
+opt_pred_primary <- predict(log_survival_primary, test_data_primary, type="response")
+opt_class_primary <- ifelse(pred_primary >= optimal_threshold$threshold, 1 , 0)
+(mr_primary <- mean(opt_class_primary != test_data_primary$hospital_outcome))
+```
+
+```{r, fig.align = "center"}
+roc_curve <- roc(test_data_primary$hospital_outcome~opt_pred_primary, 
+                 plot = T, 
+                 col="darkblue", 
+                 print.auc = T, 
+                 main = "ROC Curve for survival primary")
+```
+
+Even with the optima threshold the results do not vary.
+This can be due to the small amount of observations present in the dataset.
+
+## Logistic regression: study cohort
+
+***Logistic regression*** is now performed on the `survival_study_cohort`.   
+First, we select the variables of our interest, transform them into factorial and then split the dataset into *training* and *test* set. 
+```{r}
+study_cohort <- survival_study_cohort %>% 
+  select(age,
+         sex,
+         count_episode,
+         hospital_outcome)
+
+study_cohort$age <- as.numeric(study_cohort$age)
+study_cohort$count_episode <- as.factor(study_cohort$count_episode)
+study_cohort$sex <- as.factor(study_cohort$sex)
+study_cohort$hospital_outcome <- as.factor(study_cohort$hospital_outcome)
+
+set.seed(123)
+idx <- sample(nrow(study_cohort)*0.75)
+train_study <- study_cohort[idx,]
+test_study <- study_cohort[-idx,]
+```
+
+```{r}
+log_study <- glm(hospital_outcome ~ ., 
+                 data = train_study, 
+                 family = "binomial" )
+summary(log_study)
+```
+
+After performing the *logistic regression* on the study cohort, we can notice that there is a *positive relationship* between the intercept and `sex` covariate, and a *negative relationship* between the intercept and `age`. Covariates `age` and `sex` are strongly significant as previously assessed with the primary cohort. There is also a slight positive relationship with `count_episode3` on a significance level of 0.05.
+
+We proceed by computing the ***misclassification rate*** in order to evaluate the overall performance of the model.
+
+```{r}
+prediction_study <- predict(log_study, 
+                            newdata = test_study, 
+                            type = "response")
+class_pred_study <- ifelse(prediction_study > 0.75,1,0)
+(mr_study <- mean(ifelse(prediction_study > 0.75,1,0)!= test_study$hospital_outcome))
+```
+
+In this case, the rate is greater compared to the primary cohort, with a value corresponding to `r round(mr_study*100,2)`%, meaning that the models' classification accuracy is quite lower.
+
+Next step is to create a confusion matrix in order to compute $sensitivity$ and $specificity$.
+
+```{r}
+(conf_mat_study <- table(actual = test_study$hospital_outcome, 
+                        predicted = class_pred_study))
+```
+
+```{r}
+(sens_study <- conf_mat_study[2,2]/sum(conf_mat_study[,2]))
+(spec_study <- conf_mat_study[1,1]/sum(conf_mat_study[,1]))
+```
+
+The outcomes correspond to a $sensitivity$ value of `r round(sens_study,2)`, meaning that the rate of $TP$ is almost `r round(sens_study*100)`%, and a $specificity$ value of `r round(spec_study,2)`, so the rate of $TN$ is just `r round(spec_study*100)`%. This is due to a *positively imbalanced* dataset. 
+
+```{r}
+(roc_curve_study <- roc(test_study$hospital_outcome~prediction_study, 
+                       plot = T, 
+                       col="darkblue", 
+                       fill = "lightblue",
+                       print.auc = T, 
+                       main = "ROC Curve for study cohort"))
+```
+
+The **Area Under the Curve** has a value of 0.615, meaning that the model's performance is slightly above the average (case of random classification). The classification performance on the `survival_study_cohort` seems to be lower than previously computed on the primary cohort. The model still require improvement for better accuracy.
+
+## The validation cohort
+
+```{r, fig.align = "center"}
+str(survival_validation_cohort)
+survival_validation_cohort <- survival_validation_cohort %>%
+  select(age, 
+         sex, 
+         count_episode,
+         hospital_outcome)
+```
+
+```{r, fig.align = "center"}
+survival_validation_cohort$sex <- as.factor(survival_validation_cohort$sex)
+survival_validation_cohort$count_episode <- as.factor(survival_validation_cohort$count_episode)
+survival_validation_cohort$hospital_outcome <- as.factor(survival_validation_cohort$hospital_outcome)
+```
+
+```{r, fig.align = "center"}
+head(predictions <- predict(log_survival_primary, 
+                            newdata = survival_validation_cohort, 
+                            type="response"), 20)
+```
+
+```{r, fig.align = "center"}
+class_pred_validation <- ifelse(predictions >= 0.85, 1,0)
+(mr_primary <- mean(class_pred_validation != survival_validation_cohort$hospital_outcome))
+```
+
+```{r, fig.align = "center"}
+class_pred_validation
+```
+
+```{r, fig.align = "center"}
+(confusion_matrix <- table(predicted = class_pred_validation, 
+                           actual = survival_validation_cohort$hospital_outcome))
+```
+
+```{r, fig.align = "center"}
+roc_curve <- roc(survival_validation_cohort$hospital_outcome~predictions, 
+                 plot = T, 
+                 col="darkblue", 
+                 print.auc = T, 
+                 main = "ROC Curve for survival validation set")
+```
+
+As previously noticed, it is evident that there is a scarcity of data in the latest **ROC Curve** computation.
+Indeed, the **AUC** is below 0.5, meaning that the model is generating random predictions.\
+This kind of difficulty can be avoid by taking into account all the negative outcome from the dataset and just a bounded selection of the positive ones, potentially yielding more favorable results.
+On the other hand, this approach would fail to represent reality, which is the primary aim.\
+Alternative models can be taken into account in order to achieve more coherent results.
+
+# Survival Analysis
+
+In conducting this survival analysis, the aim is to model the the time until the infection from *sepsis* occurs.
+From the data source, it is known are the start and the of the study.
+However, what isn't known are the recovery and the end of the recovery dates.\
+Indeed, take into account the following information:
+
+**Start of the study**: 2010-01-01\
+**End of the study**: 2011-12-31\
+The study lasts **2 years**
+
+```{r, fig.align = "center"}
+set.seed(123) 
+
+# Defining the beginning and the ending dates
+start_date <- as.Date("2010-01-01")
+end_date <- as.Date("2011-12-31")
+
+# Creating a sequence of dates from start_date to end_date 
+all_dates <- seq(start_date, end_date, by = "day")
+
+# N. observations
+n_obs <- nrow(survival_primary_cohort)
+
+# Random generation of recovering date
+start_dates <- sample(all_dates, n_obs, replace = TRUE)
+
+# Generate a random interval of days for the duration of hospitalization (between 1 and 30 days)
+recovery_duration <- sample(1:30, n_obs, replace = TRUE)
+
+# Calculate the discharge dates by adding the interval of days to the admission date.
+end_dates <- start_dates + recovery_duration
+
+# Ensure that the discharge dates do not exceed the overall end date.
+end_dates <- pmin(end_dates, end_date)
+
+dates <- data.frame(start_date = start_dates, 
+                    end_date = end_dates)
+head(dates, 10)
+```
+
+```{r, fig.align = "center"}
+survival_primary_cohort <- cbind(survival_primary_cohort,dates)
+head(survival_primary_cohort)
+```
+
+```{r, fig.align = "center"}
+survival_primary_cohort$duration <- difftime(survival_primary_cohort$end_date,
+                                             survival_primary_cohort$start_date, units="days")
+
+survival_primary_cohort$duration <- as.numeric(survival_primary_cohort$duration)
+
+head(survival_primary_cohort)
+str(survival_primary_cohort)
+```
+
+Let's plot the randomly sampled recovery dates just found, in order to better understand the distribution of the hospital stay durations.
+
+```{r, fig.align = "center"}
+ggplot(data = survival_primary_cohort) +
+  geom_histogram(aes(x = duration), 
+                 bins = 25, 
+                 fill = "lightyellow", 
+                 alpha = 0.5, 
+                 color = "black") +
+  labs(x = "Days",
+       y = "Density",
+       title = "Density of Hospitalization Duration") +
+  theme_bw()
+```
+
+As we expected, the distribution shows that the data aren't evenly spread out. There are some noticeable peaks in the middle, but the rest seems to be fairly consistent.
+
+## Censoring
+
+Let's get deep down into this *survival analysis* considering **censored** data.
+From now on, ***right censoring*** is taken into account, considering subjects who exit the study before an event occurs or when the study concludes before the event manifests.
+A subject may be censored due to:
+
+-   Loss to follow-up
+-   Withdrawal from study
+-   No event by end of fixed study period
+
+In particular, referring to the main topic of this research, we analyze patients who manifested the infection by *sepsis* during the two years of data collection.
+Let's assume that those patients who have had *sepsis* more than one and then passed away are **censored**.
+
+```{r, fig.align = "center"}
+# Creating a survival object
+Surv(survival_primary_cohort$duration, survival_primary_cohort$hospital_outcome)[1:10]
+```
+
+```{r, fig.align = "center"}
+# Switching values of hospital_outcome variable
+survival_primary_cohort <- 
+  survival_primary_cohort %>% 
+  mutate(hospital_outcome=dplyr::recode(hospital_outcome,
+                                        "0"=1,
+                                        "1"=0))
+```
+
+```{r, fig.align = "center"}
+set.seed(192837465)
+data <- survival_primary_cohort %>%
+  mutate(censor = ifelse(count_episode != 1 & hospital_outcome == 1, 
+                         "Censor", 
+                         "Event"),
+         duration = as.numeric(duration)) %>%
+  select(duration, censor, count_episode) %>%
+  sample_n(size = 25, replace = FALSE) %>%
+  mutate(n = row_number()) 
+
+ggplot(data, aes(n, duration)) + 
+    geom_bar(stat = "identity", width = 0.6) + 
+    geom_point(aes(color = censor, shape = censor), 
+               size = 4) +
+    coord_flip() +
+    theme_bw() + 
+    theme(legend.title = element_blank(),
+          legend.position = "bottom") +
+    scale_color_manual(values = c("Censor" = "gold", "Event" = "#5DB7DE")) +
+    labs(y = "Duration", 
+         x = "Subject", 
+         title = "Censored Data from a Sample of 25 Subjectes from the Survival Primary Cohort Dataset")
+```
+
+The dataset under study comprises 110,204 observations.
+Therefore, in order to best visualize the above graph, a random sample of twenty-five observations was chosen.\
+Indeed, in the study time considered, it is possible to observe that only three subjects out of twenty-five are deliberated as *censored*, *i.e.* the subjects died once they have contracted the infection more than a single time.
+Let's compute the proportion of those who are event-free 20 days of hospital stay:
+
+-   Subjects 11, 14 and 23 were **censored before 20 days** of hospital stay, meaning that we are aware of the fact that they had more than one episode of *sepsis* and died before the 20$^{th}$ day.
+
+-   Subjects 2, 13 and 24 were **event free at 20 days**.
+
+-   Subject 7 had the **event on the 20 $^{th}$** day.
+
+-   All the other seventeen subjects had the **event before 20 days** and they survived.
+    Moreover, we know that they had one or more episode of *sepsis*, but don't know how many of them precisely.
+
+Of course this graph is not representative of the whole dataset; however is a good representation to understand how to compute the proportion mentioned before.
+Let's see what happens if the number of subjects increases to fifty.
+
+As the distribution of the follow-up might be skewed as we are considering a sample of the whole data, it could be interesting seeing how the number of *censored patients* differs from those with the event.
+In order to do that, let's plot an histogram:
+
+```{r, fig.align = "center"}
+ggplot(data, aes(duration, fill = censor)) +
+  geom_histogram(data = subset(data, censor == "Event"), 
+                 aes(x = duration), 
+                 bins = 15, alpha = 0.7, fill = "gold") +
+  geom_histogram(data = subset(data, censor == "Censor"), 
+                 aes(x = duration), 
+                 bins = 15, alpha = 0.5, fill = "#5DB7DE") +
+  theme_bw() + 
+  labs(x = "Duration", 
+       y = "Count", 
+       fill = "Censor", 
+       title = "Distribution of Censored Data from a Sample of 25 Subjectes from the Survival Primary Cohort Dataset")
+```
+
+The distribution doesn't present any particular skweness in this case, indeed as the general distribution.
+
+```{r, fig.align = "center"}
+set.seed(192837465)
+data <- survival_primary_cohort %>%
+  mutate(censor = ifelse(count_episode != 1 & hospital_outcome == 1, 
+                         "Censor", 
+                         "Event"),
+         duration = as.numeric(duration)) %>%
+  select(duration, censor, count_episode) %>%
+  sample_n(size = 50, replace = FALSE) %>%
+  mutate(n = row_number()) 
+
+ggplot(data, aes(n, duration)) + 
+    geom_bar(stat = "identity", width = 0.6) + 
+    geom_point(aes(color = censor, shape = censor), 
+               size = 4) +
+    coord_flip() +
+    theme_bw() + 
+    theme(legend.title = element_blank(),
+          legend.position = "bottom") +
+    scale_color_manual(values = c("Censor" = "gold", 
+                                  "Event" = "#5DB7DE")) +
+    labs(y = "Duration", 
+         x = "Subject", 
+         title = "Censored Data from a Sample of 50 Subjectes from the Survival Primary Cohort Dataset")
+
+ggplot(data, aes(duration, fill = censor)) +
+  geom_histogram(data = subset(data, censor == "Event"), 
+                 aes(x = duration), 
+                 bins = 15, alpha = 0.7, fill = "gold") +
+  geom_histogram(data = subset(data, censor == "Censor"), 
+                 aes(x = duration), 
+                 bins = 15, alpha = 0.5, fill = "#5DB7DE") +
+  theme_bw() + 
+  labs(x = "Duration", 
+       y = "Count", 
+       fill = "Censor", 
+       title = "Distribution of Censored Data from a Sample of 50 Subjectes from the \nSurvival Primary Cohort Dataset")
+```
+
+Very briefly, it is possible to notice that the number of **censored subjects** increased by one, but still all of them passed away before the 20 $^{th}$ day of hospitalization.  
+Additionally, subjects 6, 30 and 31 experienced the event on the 20$^{th}$ day of hospitalization. At the same time, the number of those subject who were event free before the same day increased to twelve. Among all the other individuals, the infection occurred before 20 days of hospital stay.  
+However, the exact timing of the event occurrence remains unknown. What is certain is that they survived and that the event occurred at least once.
+
+Regarding the density distribution of this sample, a very slight positive skewness is evident for individuals with the event.
+
+Keep in mind that this sample is too small to be a good representation of the whole dataset too.
+Still, it is a good way to visualize censored data.
+
+## Empirical Distribution Function
+
+The ***Empirical Distribution Function*** is a non-parametric approach used to estimate the underlying distribution of the data.  
+The ***EDF*** is defined as $\hat{F}(t) = 1 - \hat{S}(t)$, where $\hat{S}(t)$ is the *empirical survival function*.   
+
+Let's step back a little bit, in order to define the latest: 
+$$\hat{S}(t) = \frac{\text{Number of individuals with survival time} \ge t}{\text{Number of individuals in the dataset}}$$
+where \(t \in T\), \(T = [0,800]\).   
+
+Therefore, the **EDF** can be re-write as: 
+$$\hat{F}(t) = 1 - \frac{\text{Number of individual with survival time} \ge t}{\text{Number of individuals in the dataset}}$$
+Let's now compute our result. 
+
+```{r, fig.aling = "center"}
+data <- survival_primary_cohort %>%
+  mutate(censor = ifelse(count_episode != 1 & hospital_outcome == 1, 1, 0),
+         duration = duration) %>%
+  select(duration, censor)
+
+# EDF
+ggplot(survival_primary_cohort) + 
+  cmstatr::stat_esf(aes(x = duration)) +
+  xlab(expression(t)) + ylab(expression(S(t))) +
+  labs(title = "EDF of Survival Primary Cohort Dataset") +
+  theme_bw()
+```
+
+It appears that the data follow the path of straight line, as it is considering all the `r nrow(data)`. Indeed, the graph tells us the fact that the patients have the pretty same probability to be alive before time \(t\). This is due to the low variance on the dataset. 
+
+In order to have a better glance of how the **EDF** works, we consider some samples (100; 500; 5,000; 50,000).
+
+```{r, fig.aling = "center"}
+# Sampling 
+sample_sizes <- c(100, 500, 5000, 50000)
+
+plots <- lapply(sample_sizes, function(size) {
+  data <- survival_primary_cohort %>% 
+    sample_n(size = size, replace = FALSE)
+  
+  ggplot(data) + 
+    cmstatr::stat_esf(aes(x = duration)) +
+    xlab(expression(t)) + ylab(expression(S(t))) +
+    labs(subtitle = paste("Sample of", size, "patients")) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 12))
+})
+
+gridExtra::grid.arrange(grobs = plots, nrow = 2, ncol = 2,
+                         top = "EDF of Survival Primary Cohort Dataset")
+```
+
+By examining each sample, we can conclude that the smaller the sample size, the higher the variance in the probability of being alive after time \(t\). 
+
+```{r, fig.align = "Center"}
+s <- Surv(survival_primary_cohort$duration, 
+          survival_primary_cohort$hospital_outcome)
+sfit <- survfit(s~1)
+summary(sfit)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.align = "center"}
+ggsurvplot(fit = sfit, 
+           data = survival_primary_cohort, 
+           risk.table = TRUE, 
+           conf.int = TRUE,
+           palette = "darkgrey", 
+           ylim = c(0.6,1))
+```
+
+Looking at the graph, it is possible to notice that the *survival probability* is constant till the 10\(^{th}\) day, as the curve seems to follow a horizontal trajectory. Subsequently, there is a noticeable decline after this point, the slope becoming extremely steeper after the 20\(^{th}\)-day.
+
+```{r, fig.align = "Center"}
+sfit <- survfit(Surv (duration,hospital_outcome ) ~ sex, 
+                data = survival_primary_cohort)
+summary(sfit)
+```
+
+```{r, message = FALSE, warning = FALSE, fig.align = "center"}
+colors <- c("lightblue", "#FFDAB9")
+
+ggsurvplot(fit = sfit, 
+           data = survival_primary_cohort,
+           risk.table = TRUE, 
+           palette = colors, 
+           ylim = c(0.6,1))
+```
+
+In particular, it is possible to conclude that *women* have a greater survival probability than *men*.
+
+## Kaplan-Meier
+
+We now introduce the **Kaplan-Meier** method, which is a common tool used in the *survival analysis* in order to estimate cumulative survival over time.\
+In particular, **Kaplan-Meier** method is useful when dealing with censored survival data, where not all participants have experienced the event, *i.e.* had the *sepsis* infection at least one time and survived to it, within the two years of observation.\
+Keep in mind the the curve remains flat during time intervals where no events happen, and it decreases abruptly whenever there is a change in the `survival function` caused by an event occurrence.
+
+```{r fig.align=, message=FALSE, warning=FALSE, fig.align = "Center"}
+data <- survival_primary_cohort %>%
+  mutate(censor = ifelse(count_episode != 1 & hospital_outcome == 1, 1, 0),
+         duration = as.numeric(duration)) %>%
+  select(duration, censor)
+
+surv_fit <- survfit(Surv(data$duration, data$censor) ~ 1)
+
+plot(surv_fit, 
+     xlab = "Days", 
+     ylab = "Overall survival probability", 
+     main = "Cumulative Incidence Curve of Survival", 
+     ylim = c(0.9,1))
+```
+
+The graph above illustrates the "**Cumulative Incidence Curve of Survival**" and its evolution over time.
+It's evident that the curve maintains a relatively flat trajectory until the 10$^{th}$ day, after which it gradually begins to decline until the 20$^{th}$ day. Beyond this point, there is a sudden vertical drop in the curve. This pattern suggests that during periods of horizontal stability, the occurrence of events is minimal. 
+On the contrary, when the curve experiences a **vertical decline**, there is a corresponding **decrease** in the **cumulative incidence** of survival probability.  
+It is possible to easily deduce that it doesn't behave differently from the **EDF** curve previously computed.  
+
+When discussing the survival probability of *censored* patients, it's evident that it decreases over time.  
+Indeed, the trend of the `survival curve` over time demonstrates the fluctuation in survival probability with duration.  
+Beginning a little above 0.06, it steadily declines over time, indicating a reduction in the likelihood of survival as the duration of recovery increases.
+
+```{r, fig.align = "center"}
+data <- survival_primary_cohort %>%
+  mutate(censor = ifelse(count_episode != 1 & hospital_outcome == 1, "Censor", "Event"),
+         duration = as.numeric(duration))
+
+data_0 <- data %>% 
+  dplyr::filter(censor == "Censor")
+
+lambdahat <- mean(data_0$duration)^{-1}
+
+data_0$par <- dexp(data_0$duration, rate = lambdahat)
+
+ggplot(data_0) +
+  geom_line(aes(x = duration, y = par)) + 
+  xlab(expression(t)) + ylab(expression(S(t))) +
+  theme_bw() +
+  labs(title = "Survival Curve over Time for Censored Patients")
+```
+
+We may wight sample data in order to see if there are changes if a lower number of patients is taken into account.
+
+```{r, fig.align = "center"}
+data <- survival_primary_cohort %>%
+  mutate(censor = ifelse(count_episode != 1 & hospital_outcome == 1, "Censor", "Event"),
+         duration = as.numeric(duration))
+
+
+calculate_lambda_hat <- function(data) {
+  return(mean(data$duration)^{-1})
+}
+
+create_survival_plots <- function(data, sample_sizes, titles) {
+  plots <- list()
+  
+  for (i in seq_along(sample_sizes)) {
+    sampled_data <- data %>% 
+      sample_n(size = sample_sizes[i], replace = FALSE) %>%
+      dplyr::filter(censor == "Censor")
+    
+    lambdahat <- calculate_lambda_hat(sampled_data)
+    
+    p <- ggplot(sampled_data) +
+      geom_line(aes(x = duration, y = dexp(duration, rate = lambdahat))) + 
+      xlab(expression(t)) + ylab(expression(S(t))) +
+      theme_bw() +
+      labs(subtitle = titles[i])
+    
+    plots[[i]] <- p
+  }
+  
+  return(plots)
+}
+
+sample_sizes <- c(200, 500, 5000, 50000)
+titles <- c("Sample of 100 patients", "Sample of 500 patients", "Sample of 5,000 patients", "Sample of 50,000 patients")
+
+plots <- create_survival_plots(data, sample_sizes, titles)
+
+gridExtra::grid.arrange(grobs = plots, ncol = 2, nrow = 2, top = "Survival Curve over Time for Censored Patients")
+```
+
+As expected, the fewer subjects included in each sample, the higher the starting point of the curve at time 0. This observation suggests that with smaller sample sizes, the initial survival probabilities appear to be greater. This is caused by the variability in smaller sample sizes, where single data points may have a greater influence on the overall trend.
+
+## Cox Model
+
+The **Cox Proportional Hazard Model** is very useful to analyze the impact of several predictor variables on the event of interest.
+
+```{r, fig.align = "center"}
+(cox_model <- coxph(Surv(duration, hospital_outcome)~sex, 
+                    data = survival_primary_cohort))
+```
+
+```{r, include = FALSE}
+tidy_model <- tidy(cox_model)
+```
+
+Let's investigate the variable `sex`, which is represented with 0 for **male** and 1 for **female**.
+
+The coefficient for the variable `sex` in the **Cox Proportional Hazards Model** was estimated to be `r round(tidy_model$estimate, 2)` ($p < 0.001$).
+This suggests that for every one-unit increase in the `sex` variable, the **log hazard ratio** decreases by `r - round(tidy_model$estimate, 2)` units.
+
+Additionally, the exponential of the estimate `r round(exp(tidy_model$estimate), 2)` indicates that being female is associated with a lower hazard of experiencing the event compared to being male, given that it is less than 1.
+Moreover, the statistic of`r round(tidy_model$statistic, 2)` indicates an extremely strong association between `sex` and outcome.
+A larger absolute $z$-value corresponds to a smaller $p$-value, underscoring stronger evidence against the null hypothesis ($H_0 = 0$) and a greater significance of the predictor variable in the model.
+
+```{r, fig.align = "center"}
+(model<- survdiff(Surv(duration, hospital_outcome)~sex, 
+                  data = survival_primary_cohort))
+
+tidy_model = tidy(model)
+```
+
+The **log-rank test** let us compare the survival distribution between the two groups of the variable `sex`.
+By testing the null hypothesis, we aim to determine if there is any difference in the survival distributions between these groups.
+
+A total of $N=$ `r as.integer(tidy_model$N[1])` males and $N=$ `r as.integer(tidy_model$N[2])` females were observed in our analysis.
+The number of observed events (death) among males is *Observed* `r tidy_model$obs[1]`, while among female is *Observed* `r tidy_model$obs[2]`.
+Under the assumption of no difference in survival distributions, the expected number of events would be *Expected* `r round(tidy_model$exp[1],0)` among males and *Expected* `r round(tidy_model$exp[2],0)` among females.\
+
+This analysis highlights potential disparities in survival outcomes between males and females, based on observed and expected event counts.
+
+```{r, fig.align = "center"}
+x <- str(survival_primary_cohort)
+```
+
+```{r, fig.align = "center"}
+(full_model <- coxph(Surv(duration, hospital_outcome)~sex + count_episode + age, 
+                     data = survival_primary_cohort) )
+```
+
+```{r, include = FALSE}
+tidy_full_model <- tidy(full_model)
+```
+
+
+Here a **Cox proportional hazard model** is conducted for all variables in the dataset.
+
+-   `sex1`: the results are consistent with the previous Cox model.
+    However, there's a different $coef$ value of `r round(tidy_full_model$estimate[1],2)`.
+    This suggests that for every one-unit increase in the `sex` variable, the **log hazard ratio** decreases by `r round(tidy_full_model$estimate[1],2)` units, which aligns with existing scientific evidence indicating that females tend to survive longer than males.
+
+-   `count_episode`: the variable includes 5 levels (1,2,3,4,5), each one indicating the episode's number of *sepsis*.
+    All the count episodes have positive coefficients - except for `count_episode5`-.
+    This indicates that for each unit increase in these count episode variables, the **log hazard ratio** increases.\
+    Nevertheless, `count_episode3`, `count_episode4` and `count_episode5` have large $p$-values, suggesting that these variables aren't significance for the model.
+    So, just `count_episode2` results significant for the model.
+
+-   `age`: the $coef=$ `r round(tidy_full_model$estimate[6], 2)` suggest a **positive relationship** with the **log hazard ratio**.
+    Specifically, the *log hazard ratio* increases by about `r round(tidy_full_model$estimate[6], 4)` for every one-unit increase in the age variable, which is expected given the higher likelihood of death among older individuals.
+    In addition, its $p$-value ($p<0.0001$) demonstrates strong significance for the analysis, as evidenced by its $z=$ `r round(tidy_full_model$estimate[6], 2)`.
+
+```{r}
+ggforest(full_model, data = survival_primary_cohort)
+```
+
+Each vertical lines represents the point estimates (*hazard ratio*) of the predictor variables in the model, determining the magnitude of the effect.
+The horizontal line represents the confidence interval around the point estimate.
+
+In the figure, a dashed line at 1 represents the null value, helping in assessing the statistical significance of the effect size.
+If the confidence interval crosses this line, the effect is **not** **statistically significant**.
+
+-   `sex`: note male as a reference level.
+    Females exhibit a **hazard ratio** of 0.85, with a **95% confidence interval** between 0.81 and 0.89.
+    This suggests that patients receiving the treatment have a 0.15 **lower hazard** of the event compared to those who didn't receive it, with a 95% confidence that the **true hazard ratio** lies between 0.81 and 0.89.
+
+-   `count_episode`: note `count_episode1` as a reference level.
+    The `count_episode2` has a **hazard ratio** of 1.11, with a 95% confidence interval between 1.04 and 1.17.
+    Instead, the `count_episode3` and `count_episode4` have hazard ratios of 1.04, with confidence intervals ranging from 0.94 to 1.15 and 0.89 to 1.21, respectively.
+    Additionally, `count_episode5` has a hazard ratio of 0.92, with a confidence interval between 0.72 and 1.16.
+    Moreover, the `count_episode5` has a **hazard ratio** of 0.92, with a confidence interval between 0.72 and 1.16.
+    So, briefly, `count_episode3` and `count_episode4` have a 0.04 **higher hazard** to the event compared to those that didn't receive the treatment, while `count_episode5` has a 0.08 **lower hazard** to the event.
+    However, looking at the confidence intervals, the `count_episode4` and `count_episode5` appear more risky.
+    In addition, looking at the $p$-values, we can't rely on `count_episode3`, `count_episode4` and `count_episode5` because they aren't statistically significant.
+
+-   `age`: it has an **hazard ratio** of 1.04, indicating that patients receiving treatment have a 0.04 **higher hazard** of mortality.
+
+Finally, the **Concordance Index** is a measure of the discriminatory power of a survival model. Its value is 0.69 indicating a quite good predictive performance.
+
+```{r, echo = TRUE}
+mv_fit <- coxph(Surv(duration, hospital_outcome) ~ sex + age, 
+                data = survival_primary_cohort)
+cz <- cox.zph(mv_fit)
+print(cz)
+```
+
+The evaluation of whether the assumptions underlying the *Cox Model*, particularly the proportional hazards assumption, hold for the predictor variables `sex` and `age` included in our model.
+This process helps ensure the validity of our *cox regression analysis*.
+
+Looking at the $p$-values of `sex` and `age` (`r round(cz$table[1, "p"], 2)` and `r round(cz$table[2, "p"],2)`), it is observed that they are greater than 0.05, suggesting no violation of the proportional hazard assumptions for these variables.\
+Additionally, for the `GLOBAL` assessment, the proportional hazard assumptions for the entire model are evaluated.
+
+Looking at the $p$-value, which equals `r round(cz$table[3, "p"], 2)`, it can be said that there is no violation of the proportional hazard assumptions for the entire model.  
+
+In the end, it has been decided to leave out `count_episode` variable as it is not statistically significant, in order to not fall into failing results. 
+
+# Conclusion
+
+In conclusion, the ***Cox Model***, presented similar results to the ***logistic regression***.   
+
+As a matter of fact, the variables `sex`, `age` and `count_episode2` are **strongly statistically significant**. This indicates their reliability in predicting whether an individual survives *sepsis*. Unfortunately, it cannot be said the same for `count_episode3`, `count_episode4` and `count_episode5`.
+
+In addition, *females* have more probability to survive than *males.* People with two or more episodes have more probability to die, where those who are associated to variable `count_episode4` are exposed to a greater risk. The variable `age` has a positive relationship with death (`hospital_outcome` == 1), implying that older people have more chance to die.
