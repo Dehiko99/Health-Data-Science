@@ -12,4 +12,4 @@ Then, we used survivaò analysis to analyze the survival patterns and trends of 
 - Cox Proportional-Hazards Model: This semi-parametric model was utilized to explore the relationship between the survival time of patients and one or more predictor variables. It allows for the assessment of how different factors impact 
 survival rates.
 
-This project was done by: **Alberto Baresin****Nicolae Bologa**,**Eleonora Marcassa**
+This project was done by: **Alberto Baresin**,**Nicolae Bologa**,**Eleonora Marcassa**
