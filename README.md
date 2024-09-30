@@ -11,4 +11,5 @@ Then, we used survivaò analysis to analyze the survival patterns and trends of 
 - Kaplan-Meier Estimator: This non-parametric statistic was used to estimate the survival function from the lifetime data. It helps in understanding the proportion of patients surviving for a certain amount of time after diagnosis.
 - Cox Proportional-Hazards Model: This semi-parametric model was utilized to explore the relationship between the survival time of patients and one or more predictor variables. It allows for the assessment of how different factors impact 
 survival rates.
-  
+
+This project was done by: **Alberto Baresin****Nicolae Bologa**,**Eleonora Marcassa**
